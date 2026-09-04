@@ -1,104 +1,163 @@
-𝐒𝐀𝐉𝐀𝐃 𝐀𝐃𝐄𝐋, [⁨4⁩ سبتمبر ⁨2026⁩ في ⁨8:18 PM⁩
-]
-return
-    context.user_data["awaiting_broadcast"] = True
-    await query.message.reply_text("📣 قم بإرسال الرسالة الآن (نص، صورة، ملصق...) للبدء بنشرها لكل المستخدمين:")
+import os
+import asyncio
+import logging
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-elif data.startswith("ban_user_"):
-    if not get_permission("ban"):
-        await query.answer("❌ لا تملك صلاحية الحظر!", show_alert=True)
-        return
-    uid = int(data.split("_")[2])
-    set_ban_user(uid, True)
-    await query.answer("✅ تم حظر المستخدم بنجاح!", show_alert=True)
-elif data.startswith("unban_user_"):
-    if not get_permission("ban"):
-        await query.answer("❌ لا تملك صلاحية إلغاء الحظر!", show_alert=True)
-        return
-    uid = int(data.split("_")[2])
-    set_ban_user(uid, False)
-    await query.answer("✅ تم إلغاء حظر المستخدم!", show_alert=True)
-async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE): user = update.effective_user
-if user.id == ADMIN_ID and context.user_data.get("awaiting_broadcast"):
-    context.user_data["awaiting_broadcast"] = False
+# Logging setup
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# Token & Admin ID from environment variables
+TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+# Database setup
+def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE is_banned = 0")
-    users = cursor.fetchall()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_banned INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS permissions (
+            perm_name TEXT PRIMARY KEY,
+            is_allowed INTEGER DEFAULT 1
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO permissions (perm_name, is_allowed) VALUES ('broadcast', 1)")
+    cursor.execute("INSERT OR IGNORE INTO permissions (perm_name, is_allowed) VALUES ('ban', 1)")
+    conn.commit()
     conn.close()
 
-    success = 0
-    failed = 0
-    await update.message.reply_text(f"⏳ جاري بدء الإذاعة لـ {len(users)} مستخدم...")
+init_db()
 
-    for (u_id,) in users:
-        if u_id == ADMIN_ID:
-            continue
-        try:
-            await update.message.copy(chat_id=u_id)
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
+def get_permission(perm_name):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_allowed FROM permissions WHERE perm_name = ?", (perm_name,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] == 1 if res else True
 
-    await update.message.reply_text(
-        f"✅ **تمت الإذاعة بنجاح!**\n\n"
-        f"🟢 الناجحة: {success}\n"
-        f"🔴 الفاشلة (حظر أو مغادرة): {failed}",
-        parse_mode="Markdown"
-    )
-    return
+def set_permission(perm_name, status):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE permissions SET is_allowed = ? WHERE perm_name = ?", (1 if status else 0, perm_name))
+    conn.commit()
+    conn.close()
 
-if user.id == ADMIN_ID:
-    if update.message.reply_to_message:
-        if not get_permission("replies"):
-            await update.message.reply_text("❌ لا تملك صلاحية الردود حالياً.")
+def is_user_banned(user_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] == 1 if res else False
+
+def add_user(user_id, username):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+    conn.commit()
+    conn.close()
+
+def set_ban_user(user_id, status):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (1 if status else 0, user_id))
+    conn.commit()
+    conn.close()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_user_banned(user.id):
+        await update.message.reply_text("❌ أنت محظور من استخدام البوت.")
+        return
+
+    add_user(user.id, user.username)
+
+    if user.id == ADMIN_ID:
+        keyboard = [
+            [InlineKeyboardButton("📢 الإذاعة العامة", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("⚙️ إعدادات الصلاحيات", callback_data="admin_perms")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("أهلاً بك يا مدير! اختر خياراً:", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(f"أهلاً بك {user.first_name}! مرحباً بك في البوت.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "admin_broadcast":
+        if not get_permission("broadcast"):
+            await query.answer("❌ تم إيقاف صلاحية الإذاعة.", show_alert=True)
             return
-        target_msg = update.message.reply_to_message
-        try:
-            first_line = target_msg.text or target_msg.caption or ""
-            user_id = int(first_line.split("ID:** `")[1].split("`")[0])
-            
-            await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=ADMIN_ID,
-                message_id=update.message.message_id
-            )
-            await update.message.reply_text("✅ تم إرسال الرد بنجاح!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ تعذر استخراج ايدي المستخدم أو إرسال الرد: {e}")
-    return
+        context.user_data["awaiting_broadcast"] = True
+        await query.message.reply_text("📣 أرسل الرسالة التي تريد إذاعتها للمستخدمين:")
 
-if is_user_banned(user.id):
-    await update.message.reply_text("❌ أنت محظور من استخدام البوت.")
-    return
+    elif data == "admin_perms":
+        b_perm = get_permission("broadcast")
+        keyboard = [
+            [InlineKeyboardButton(f"الإذاعة: {'مفعلة ✅' if b_perm else 'معطلة ❌'}", callback_data="toggle_broadcast")],
+            [InlineKeyboardButton("🔙 العودة", callback_data="admin_main")]
+        ]
+        await query.edit_message_text("تعديل الصلاحيات:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-show_username = get_setting("show_sender_username") == "1"
-sender_info = f"@{user.username}" if (show_username and user.username) else "مخفي"
+    elif data == "toggle_broadcast":
+        cur = get_permission("broadcast")
+        set_permission("broadcast", not cur)
+        await button_handler(update, context)
 
-header_text = (
-    f"📩arkdown")
-elif data ={user.full_name} ({sender_info})\n"
-    f"🆔 ID: `{user.id}`"
-)
+    elif data == "admin_main":
+        keyboard = [
+            [InlineKeyboardButton("📢 الإذاعة العامة", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("⚙️ إعدادات الصلاحيات", callback_data="admin_perms")]
+        ]
+        await query.edit_message_text("أهلاً بك يا مدير! اختر خياراً:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-is_banned = is_user_banned(user.id)
-ban_btn_text = "إلغاء الحظر 🔓" if is_banned else "حظر المستخدم 🚫"
-ban_cb_data = f"unban_user_{user.id}" if is_banned else f"ban_user_{user.id}"
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_user_banned(user.id):
+        return
 
-admin_markup = InlineKeyboardMarkup([
-    [InlineKeyboardButton(ban_btn_text, callback_data=ban_cb_data)]
-])
+    if user.id == ADMIN_ID and context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        conn = sqlite3.connect("bot_database.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        users = cursor.fetchall()
+        conn.close()
 
-await context.bot.send_message(chat_id=ADMIN_ID, text=header_text, parse_mode="Markdown", reply_markup=admin_markup)
-await update.message.forward(chat_id=ADMIN_ID)
+        success = 0
+        failed = 0
+        await update.message.reply_text("⏳ جاري إرسال الإذاعة...")
 
-await update.message.reply_text("تم إرسال رسالتك للمشرف بنجاح!")
-def main(): init_db() app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(handle_callback))
-app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
+        for (u_id,) in users:
+            if u_id == ADMIN_ID:
+                continue
+            try:
+                await update.message.copy(chat_id=u_id)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
 
-print("البوت الجاهز للإنتاج يعمل بنجاح...")
-app.run_polling()
-if name == "main": main()
+        await update.message.reply_text(f"✅ تم الانتهاء!\nتم الإرسال لـ: {success}\nفشل الإرسال لـ: {failed}")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
